@@ -1,0 +1,307 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <time.h>
+
+#define ALPH 256
+#define MAX_CODE_LEN 256
+#define HDR_MAGIC 0x48465546  /* "HFUF" just a marker */
+
+typedef struct Node {
+    unsigned char ch;
+    unsigned long freq;
+    struct Node *l, *r;
+} Node;
+
+typedef struct {
+    Node **a;
+    int n, cap;
+} Pq;
+
+Pq *pq_new(int c){
+    Pq *q = malloc(sizeof(Pq));
+    q->cap = c;
+    q->n = 0;
+    q->a = malloc(sizeof(Node*) * c);
+    return q;
+}
+
+void pq_push(Pq *q, Node *x){
+    if(q->n >= q->cap){
+        q->cap *= 2;
+        q->a = realloc(q->a, sizeof(Node*) * q->cap);
+    }
+    int i = q->n++;
+    q->a[i] = x;
+    while(i>0){
+        int p = (i-1)/2;
+        if(q->a[p]->freq <= q->a[i]->freq) break;
+        Node *t = q->a[p]; q->a[p] = q->a[i]; q->a[i] = t;
+        i = p;
+    }
+}
+
+Node *pq_pop(Pq *q){
+    if(q->n == 0) return NULL;
+    Node *r = q->a[0];
+    q->n--;
+    q->a[0] = q->a[q->n];
+    int i = 0;
+    while(1){
+        int l = 2*i+1, rgt = 2*i+2, s = i;
+        if(l < q->n && q->a[l]->freq < q->a[s]->freq) s = l;
+        if(rgt < q->n && q->a[rgt]->freq < q->a[s]->freq) s = rgt;
+        if(s==i) break;
+        Node *t = q->a[i]; q->a[i]=q->a[s]; q->a[s]=t;
+        i = s;
+    }
+    return r;
+}
+
+Node *mknode(unsigned char ch, unsigned long f){
+    Node *n = malloc(sizeof(Node));
+    n->ch = ch;
+    n->freq = f;
+    n->l = n->r = NULL;
+    return n;
+}
+
+Node *build_tree(unsigned long freq[ALPH]){
+    Pq *q = pq_new(128);
+    for(int i=0;i<ALPH;i++){
+        if(freq[i] > 0){
+            pq_push(q, mknode((unsigned char)i, freq[i]));
+        }
+    }
+    if(q->n == 0){
+        free(q->a); free(q);
+        return NULL;
+    }
+    while(q->n > 1){
+        Node *a = pq_pop(q);
+        Node *b = pq_pop(q);
+        Node *p = mknode(0, a->freq + b->freq);
+        p->l = a; p->r = b;
+        pq_push(q, p);
+    }
+    Node *root = pq_pop(q);
+    free(q->a); free(q);
+    return root;
+}
+
+char codes[ALPH][MAX_CODE_LEN];
+int codes_len[ALPH];
+
+void gen_codes(Node *n, char *buf, int depth){
+    if(!n) return;
+    if(!n->l && !n->r){
+        buf[depth] = 0;
+        strncpy(codes[n->ch], buf, MAX_CODE_LEN-1);
+        codes_len[n->ch] = depth;
+        return;
+    }
+    if(n->l){
+        buf[depth] = '0';
+        gen_codes(n->l, buf, depth+1);
+    }
+    if(n->r){
+        buf[depth] = '1';
+        gen_codes(n->r, buf, depth+1);
+    }
+}
+
+void free_tree(Node *n){
+    if(!n) return;
+    free_tree(n->l);
+    free_tree(n->r);
+    free(n);
+}
+
+int write_bits(FILE *f, uint8_t *outbuf, int *outpos, int *bitpos, int bit){
+    if(*bitpos == 8){
+        if(fwrite(outbuf, 1, *outpos, f) != (size_t)*outpos) return 0;
+        *outpos = 0; *bitpos = 0;
+    }
+    if(bit) outbuf[*outpos] |= (1 << (7 - (*bitpos)));
+    (*bitpos)++;
+    if(*bitpos == 8) { (*outpos)++; *bitpos = 0; outbuf[*outpos]=0; }
+    return 1;
+}
+
+int flush_bits(FILE *f, uint8_t *outbuf, int *outpos, int *bitpos){
+    if(*bitpos > 0) { (*outpos)++; }
+    if(*outpos > 0){
+        if(fwrite(outbuf,1,*outpos,f) != (size_t)(*outpos)) return 0;
+    }
+    *outpos = 0; *bitpos = 0;
+    return 1;
+}
+
+int save_header(FILE *f, unsigned long freq[ALPH]){
+    uint32_t magic = HDR_MAGIC;
+    if(fwrite(&magic, sizeof(magic), 1, f) != 1) return 0;
+    if(fwrite(freq, sizeof(unsigned long), ALPH, f) != ALPH) return 0;
+    return 1;
+}
+
+int load_header(FILE *f, unsigned long freq[ALPH]){
+    uint32_t magic = 0;
+    if(fread(&magic, sizeof(magic), 1, f) != 1) return 0;
+    if(magic != HDR_MAGIC) return 0;
+    if(fread(freq, sizeof(unsigned long), ALPH, f) != ALPH) return 0;
+    return 1;
+}
+
+int encode_file(const char *infn, const char *outfn){
+    FILE *fin = fopen(infn, "rb");
+    if(!fin) { printf("cannot open %s\n", infn); return 0; }
+    unsigned long freq[ALPH] = {0};
+    int c;
+    unsigned long total = 0;
+    while((c = fgetc(fin)) != EOF){
+        freq[(unsigned char)c]++;
+        total++;
+    }
+    if(total == 0){ printf("empty input\n"); fclose(fin); return 0; }
+    rewind(fin);
+    Node *root = build_tree(freq);
+    if(!root){ fclose(fin); return 0; }
+    char buf[512];
+    gen_codes(root, buf, 0);
+    FILE *fout = fopen(outfn, "wb");
+    if(!fout){ printf("cannot write %s\n", outfn); free_tree(root); fclose(fin); return 0; }
+    if(!save_header(fout, freq)){ printf("write header fail\n"); fclose(fout); free_tree(root); fclose(fin); return 0; }
+    uint8_t outbuf[4096]; memset(outbuf,0,sizeof(outbuf));
+    int outpos = 0, bitpos = 0;
+    while((c = fgetc(fin)) != EOF){
+        unsigned char uc = (unsigned char)c;
+        for(int i=0;i<codes_len[uc];i++){
+            int bit = codes[uc][i] == '1';
+            if(!write_bits(fout, outbuf, &outpos, &bitpos, bit)){
+                printf("write error\n");
+                fclose(fout); free_tree(root); fclose(fin); return 0;
+            }
+        }
+        if(bitpos == 0 && outpos > 0 && outpos >= (int)sizeof(outbuf)) {
+            if(fwrite(outbuf,1,outpos,fout) != (size_t)outpos){ printf("flush fail\n"); fclose(fout); free_tree(root); fclose(fin); return 0; }
+            outpos = 0; memset(outbuf,0,sizeof(outbuf));
+        }
+    }
+    if(!flush_bits(fout, outbuf, &outpos, &bitpos)){ printf("flush fail\n"); fclose(fout); free_tree(root); fclose(fin); return 0; }
+    fclose(fout);
+    fclose(fin);
+    free_tree(root);
+    printf("encoded %lu bytes -> %s\n", total, outfn);
+    return 1;
+}
+
+int decode_file(const char *infn, const char *outfn){
+    FILE *fin = fopen(infn, "rb");
+    if(!fin){ printf("cannot open %s\n", infn); return 0; }
+    unsigned long freq[ALPH] = {0};
+    if(!load_header(fin, freq)){ printf("bad header or not huffman\n"); fclose(fin); return 0; }
+    Node *root = build_tree(freq);
+    if(!root){ printf("empty tree\n"); fclose(fin); return 0; }
+    FILE *fout = fopen(outfn, "wb");
+    if(!fout){ printf("cannot write %s\n", outfn); free_tree(root); fclose(fin); return 0; }
+    Node *cur = root;
+    int byte;
+    while((byte = fgetc(fin)) != EOF){
+        for(int i=7;i>=0;i--){
+            int bit = (byte >> i) & 1;
+            if(bit) cur = cur->r; else cur = cur->l;
+            if(!cur->l && !cur->r){
+                fputc(cur->ch, fout);
+                cur = root;
+            }
+        }
+    }
+    fclose(fout);
+    fclose(fin);
+    free_tree(root);
+    printf("decoded -> %s\n", outfn);
+    return 1;
+}
+
+void print_codes_from_freq(unsigned long freq[ALPH]){
+    Node *root = build_tree(freq);
+    if(!root) { puts("no data"); return; }
+    char tmp[512]; gen_codes(root,tmp,0);
+    puts("symbol : code (len) : freq");
+    for(int i=0;i<ALPH;i++){
+        if(freq[i]){
+            printf("%3d '%c' : %s (%d) : %lu\n", i, (i>=32 && i<127)?(char)i:'.', codes[i], codes_len[i], freq[i]);
+        }
+    }
+    free_tree(root);
+}
+
+void freq_from_file(const char *fn, unsigned long freq[ALPH]){
+    FILE *f = fopen(fn,"rb");
+    if(!f) return;
+    int c; while((c=fgetc(f))!=EOF) freq[(unsigned char)c]++;
+    fclose(f);
+}
+
+void freq_from_text(const char *s, unsigned long freq[ALPH]){
+    for(const unsigned char *p=(const unsigned char*)s; *p; ++p) freq[*p]++;
+}
+
+void menu(){
+    for(;;){
+        puts("\n1: encode file  2: decode file  3: show codes from file  4: ad-hoc text encode 0: exit");
+        printf("choice: ");
+        int ch; if(scanf("%d",&ch)!=1){ while(getchar()!='\n'); puts("bad"); continue; }
+        while(getchar()!='\n');
+        if(ch==0) break;
+        if(ch==1){
+            char in[512], out[512];
+            printf("input file: "); if(!fgets(in,512,stdin)) continue; in[strcspn(in,"\n")]=0;
+            printf("out file: "); if(!fgets(out,512,stdin)) continue; out[strcspn(out,"\n")]=0;
+            unsigned long freq[ALPH]={0};
+            freq_from_file(in,freq);
+            memset(codes,0,sizeof(codes)); memset(codes_len,0,sizeof(codes_len));
+            Node *t = build_tree(freq);
+            if(!t){ printf("empty input\n"); free_tree(t); continue; }
+            char tmp[512]; gen_codes(t,tmp,0); free_tree(t);
+            if(!encode_file(in,out)) puts("encode failed");
+        } else if(ch==2){
+            char in[512], out[512];
+            printf("encoded file: "); if(!fgets(in,512,stdin)) continue; in[strcspn(in,"\n")]=0;
+            printf("out file: "); if(!fgets(out,512,stdin)) continue; out[strcspn(out,"\n")]=0;
+            if(!decode_file(in,out)) puts("decode failed");
+        } else if(ch==3){
+            char in[512];
+            printf("file: "); if(!fgets(in,512,stdin)) continue; in[strcspn(in,"\n")]=0;
+            unsigned long freq[ALPH]={0};
+            freq_from_file(in,freq);
+            memset(codes,0,sizeof(codes)); memset(codes_len,0,sizeof(codes_len));
+            print_codes_from_freq(freq);
+        } else if(ch==4){
+            char txt[4096];
+            printf("text (single line): "); if(!fgets(txt,4096,stdin)) continue; txt[strcspn(txt,"\n")]=0;
+            unsigned long freq[ALPH]={0};
+            freq_from_text(txt,freq);
+            memset(codes,0,sizeof(codes)); memset(codes_len,0,sizeof(codes_len));
+            Node *t = build_tree(freq);
+            if(!t){ puts("empty"); free_tree(t); continue; }
+            char tmp[512]; gen_codes(t,tmp,0);
+            puts("codes:");
+            for(int i=0;i<ALPH;i++) if(freq[i]) printf("%3d '%c' : %s\n", i, (i>=32 && i<127)?(char)i:'.', codes[i]);
+            free_tree(t);
+            printf("encoded bits: ");
+            for(const unsigned char *p=(const unsigned char*)txt; *p; ++p){
+                printf("%s", codes[*p]);
+            }
+            puts("");
+        } else {
+            puts("unknown");
+        }
+    }
+}
+
+int main(){
+    menu();
+    return 0;
+}

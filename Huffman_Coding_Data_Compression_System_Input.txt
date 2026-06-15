@@ -1,0 +1,2 @@
+Data compression reduces the size of files.
+Huffman coding is a popular method for efficient compression.
